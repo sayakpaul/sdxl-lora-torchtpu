@@ -1,0 +1,199 @@
+--- a/train_dreambooth_lora_sdxl.py
++++ b/train_dreambooth_lora_sdxl.py
+@@ -23,6 +23,7 @@
+ import os
+ import random
+ import shutil
++import time
+ import warnings
+ from contextlib import nullcontext
+ from pathlib import Path
+@@ -1160,28 +1161,12 @@
+     text_encoder_two.requires_grad_(False)
+     unet.requires_grad_(False)
+ 
+-    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
+-    # as these weights are only used for inference, keeping weights in full precision is not required.
+-    weight_dtype = torch.float32
+-    if accelerator.mixed_precision == "fp16":
+-        weight_dtype = torch.float16
+-    elif accelerator.mixed_precision == "bf16":
+-        weight_dtype = torch.bfloat16
+-
+-    if torch.backends.mps.is_available() and weight_dtype == torch.bfloat16:
+-        # due to pytorch#99272, MPS does not yet support bfloat16.
+-        raise ValueError(
+-            "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
+-        )
+-
+-    # Move unet, vae and text_encoder to device and cast to weight_dtype
++    # The frozen encoders run once on the host. Only the denoiser trains on the chip.
++    weight_dtype = torch.bfloat16
+     unet.to(accelerator.device, dtype=weight_dtype)
+-
+-    # The VAE is always in float32 to avoid NaN losses.
+-    vae.to(accelerator.device, dtype=torch.float32)
+-
+-    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+-    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
++    vae.to(device="cpu", dtype=torch.float32).eval()
++    text_encoder_one.to(device="cpu", dtype=torch.float32).eval()
++    text_encoder_two.to(device="cpu", dtype=torch.float32).eval()
+ 
+     if args.enable_xformers_memory_efficient_attention:
+         if is_xformers_available():
+@@ -1344,14 +1329,10 @@
+             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+         )
+ 
+-    # Make sure the trainable params are in float32.
+-    if args.mixed_precision == "fp16":
+-        models = [unet]
+-        if args.train_text_encoder:
+-            models.extend([text_encoder_one, text_encoder_two])
+-
+-        # only upcast trainable parameters (LoRA) into fp32
+-        cast_training_params(models, dtype=torch.float32)
++    # Keep AdamW moments and the small trainable adapters in FP32.
++    cast_training_params([unet], dtype=torch.float32)
++    if os.environ.get("SDXL_COMPILE_BLOCKS") == "1":
++        unet.compile_repeated_blocks(backend="tpu", dynamic=False)
+ 
+     unet_lora_parameters = list(filter(lambda p: p.requires_grad, unet.parameters()))
+ 
+@@ -1461,26 +1442,22 @@
+         center_crop=args.center_crop,
+     )
+ 
+-    train_dataloader = torch.utils.data.DataLoader(
+-        train_dataset,
+-        batch_size=args.train_batch_size,
+-        shuffle=True,
+-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+-        num_workers=args.dataloader_num_workers,
+-    )
+-
+-    # Computes additional embeddings/ids required by the SDXL UNet.
+-    # regular text embeddings (when `train_text_encoder` is not True)
+-    # pooled text embeddings
+-    # time ids
+-
+-    def compute_time_ids(original_size, crops_coords_top_left):
+-        # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
+-        target_size = (args.resolution, args.resolution)
+-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+-        add_time_ids = torch.tensor([add_time_ids])
+-        add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
+-        return add_time_ids
++    # Cache each image's posterior together with the crop that produced it.
++    # Sampling the posterior in the loop preserves the VAE's training stochasticity.
++    samples = []
++    with torch.no_grad():
++        for i in tqdm(range(len(train_dataset)), desc="Encoding instance images"):
++            example = train_dataset[i]
++            posterior = vae.encode(example["instance_images"].unsqueeze(0)).latent_dist
++            time_ids = (*example["original_size"], *example["crop_top_left"], args.resolution, args.resolution)
++            samples.append({
++                "latent_mean": posterior.mean[0],
++                "latent_std": posterior.std[0],
++                "time_ids": torch.tensor(time_ids, dtype=weight_dtype),
++                "prompts": example["instance_prompt"],
++            })
++
++    train_dataloader = torch.utils.data.DataLoader(samples, batch_size=args.train_batch_size, shuffle=True)
+ 
+     if not args.train_text_encoder:
+         tokenizers = [tokenizer_one, tokenizer_two]
+@@ -1489,8 +1466,8 @@
+         def compute_text_embeddings(prompt, text_encoders, tokenizers):
+             with torch.no_grad():
+                 prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt)
+-                prompt_embeds = prompt_embeds.to(accelerator.device)
+-                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
++                prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
++                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device, dtype=weight_dtype)
+             return prompt_embeds, pooled_prompt_embeds
+ 
+     # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
+@@ -1590,7 +1567,9 @@
+             if "playground" not in args.pretrained_model_name_or_path
+             else "dreambooth-lora-playground"
+         )
+-        accelerator.init_trackers(tracker_name, config=vars(args))
++        tracker_kwargs = {"trackio": {"name": os.environ.get("SDXL_TRACKIO_RUN_NAME"), "auto_log_gpu": False}}
++        config = {**vars(args), "device": str(accelerator.device), "unet_dtype": str(weight_dtype)}
++        accelerator.init_trackers(tracker_name, config=config, init_kwargs=tracker_kwargs)
+ 
+     # Train!
+     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+@@ -1668,7 +1647,6 @@
+ 
+         for step, batch in enumerate(train_dataloader):
+             with accelerator.accumulate(unet):
+-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+                 prompts = batch["prompts"]
+ 
+                 # encode batch prompts when custom prompts are provided for each image -
+@@ -1682,7 +1660,8 @@
+                         tokens_two = tokenize_prompt(tokenizer_two, prompts)
+ 
+                 # Convert images to latent space
+-                model_input = vae.encode(pixel_values).latent_dist.sample()
++                mean = batch["latent_mean"]
++                model_input = mean + batch["latent_std"] * torch.randn_like(mean)
+ 
+                 if latents_mean is None and latents_std is None:
+                     model_input = model_input * vae.config.scaling_factor
+@@ -1725,12 +1704,7 @@
+                         inp_noisy_latents = noisy_model_input / ((sigmas**2 + 1) ** 0.5)
+ 
+                 # time ids
+-                add_time_ids = torch.cat(
+-                    [
+-                        compute_time_ids(original_size=s, crops_coords_top_left=c)
+-                        for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])
+-                    ]
+-                )
++                add_time_ids = batch["time_ids"]
+ 
+                 # Calculate the elements to repeat depending on the use of prior-preservation and custom captions.
+                 if not train_dataset.custom_instance_prompts:
+@@ -1902,6 +1876,16 @@
+                         logger.info(f"Saved state to {save_path}")
+ 
+             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
++            if not math.isfinite(logs["loss"]):
++                raise FloatingPointError(f"Non-finite loss at step {global_step}")
++            # Exclude model loading, preprocessing and the first (cold) optimizer step.
++            if global_step == 1:
++                torch.accelerator.synchronize(accelerator.device)
++                timed_start = time.perf_counter()
++            elif global_step == args.max_train_steps:
++                torch.accelerator.synchronize(accelerator.device)
++                seconds = time.perf_counter() - timed_start
++                logger.info(f"Steps 2–{global_step}: {seconds / (global_step - 1):.2f} s/optimizer step")
+             progress_bar.set_postfix(**logs)
+             accelerator.log(logs, step=global_step)
+ 
+@@ -1949,8 +1933,8 @@
+     accelerator.wait_for_everyone()
+     if accelerator.is_main_process:
+         unet = unwrap_model(unet)
+-        unet = unet.to(torch.float32)
+-        unet_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
++        adapter_state = {k: v.detach().to("cpu", torch.float32) for k, v in get_peft_model_state_dict(unet).items()}
++        unet_lora_layers = convert_state_dict_to_diffusers(adapter_state)
+ 
+         if args.train_text_encoder:
+             text_encoder_one = unwrap_model(text_encoder_one)
+@@ -1976,6 +1960,10 @@
+             peft_state_dict = convert_all_state_dict_to_peft(lora_state_dict)
+             kohya_state_dict = convert_state_dict_to_kohya(peft_state_dict)
+             save_file(kohya_state_dict, f"{args.output_dir}/pytorch_lora_weights_kohya.safetensors")
++
++        if not args.validation_prompt and not args.push_to_hub:
++            accelerator.end_training()
++            return
+ 
+         # Final inference
+         # Load previous pipeline
