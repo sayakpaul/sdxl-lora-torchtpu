@@ -7,7 +7,7 @@ Shows how to fine-tune SDXL using LoRA and the changes needed to make it run on 
 We start by making some changes to the [existing
 training script](https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_sdxl.md) in Diffusers:
 
-- Accelerate runs the U-Net on `tpu:0` through TorchTPU. Frozen weights use BF16, while the LoRA weights and AdamW state use FP32.
+- [Accelerate](https://huggingface.co/docs/accelerate/en/index) runs the U-Net on `tpu:0` through TorchTPU. Frozen weights use BF16, while the LoRA weights and AdamW state use FP32.
 - Before training, the CPU encodes the prompt and caches each photo’s VAE mean and standard deviation. The TPU samples a fresh latent at each update.
 - The Colab v5e1 run uses gradient checkpointing to fit in memory. For previews, the TPU denoises and the CPU decodes the final images.
 
@@ -55,7 +55,7 @@ Both images use the prompt “a photo of sks dog wearing a red scarf,” seed 0,
 
 ## Inference on CUDA
 
-Load either TPU-trained adapter into SDXL Base on a CUDA GPU. Both were verified on an NVIDIA A10G. [Compare the GPU outputs](https://huggingface.co/sayakpaul/torchtpu-sdxl-lora-sprint#gpu-inference-verification)
+Load either TPU-trained adapter into SDXL Base on a CUDA GPU. Both were verified on an NVIDIA A10G.
 
 ```python
 import torch
@@ -76,3 +76,5 @@ image = pipe(
 ).images[0]
 image.save("dog.png")
 ```
+
+[Compare the GPU outputs.](https://huggingface.co/sayakpaul/torchtpu-sdxl-lora-sprint#gpu-inference-verification)
